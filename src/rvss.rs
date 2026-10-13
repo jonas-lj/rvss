@@ -10,7 +10,6 @@ use fastcrypto_tbls::polynomial::Poly;
 use itertools::Itertools;
 use rand::{thread_rng, RngCore};
 use serde::Serialize;
-use std::num::NonZeroU16;
 
 /////// Implementation of the RVSS protocol for performance testing ONLY ///////
 
@@ -167,32 +166,28 @@ impl LDProof {
         g2: &[Point],
         h1: &[Point],
         h2: &[Point],
-        alphas: &[usize],
         t: usize,
         w: &Poly<Scalar>,
     ) -> LDProof {
         assert!(g1.len() == g2.len());
         assert!(g1.len() == h1.len());
         assert!(g1.len() == h2.len());
-        assert!(g1.len() == alphas.len());
         assert!(w.degree() <= t);
 
         let ro = RandomOracle::new("mldei");
 
         let r = Poly::rand(t as u16, &mut thread_rng());
+        let r_values = eval_at_share_points(&r, g1.len() - 1);
 
         let x = g1
             .iter()
             .zip(g2.iter())
-            .enumerate()
-            .map(|(j, (base1, base2))| {
-                let r_j = poly_eval_at(&r, alphas[j]);
-                [base1 * r_j, base2 * r_j]
-            })
+            .zip(r_values)
+            .map(|((base1, base2), r_j)| [base1 * r_j, base2 * r_j])
             .collect_vec();
 
-        let e: Scalar =
-            Scalar::hash_to_group_element(&ro.evaluate(&(g1, g2, h1, h2, alphas, t, &x)));
+        // The evaluation points are fixed by the vector length, so they need not be hashed
+        let e: Scalar = Scalar::hash_to_group_element(&ro.evaluate(&(g1, g2, h1, h2, t, &x)));
         let neg_e = -e;
         let z = r + &(w.clone() * &neg_e);
 
@@ -205,7 +200,6 @@ impl LDProof {
         g2: &[Point],
         h1: &[Point],
         h2: &[Point],
-        alphas: &[usize],
         t: usize,
     ) -> FastCryptoResult<()> {
         let ro = RandomOracle::new("mldei");
@@ -214,8 +208,11 @@ impl LDProof {
         if self.z.degree() > t {
             return Err(FastCryptoError::InvalidProof);
         }
+        if self.x.is_empty() || self.x.len() != g1.len() {
+            return Err(FastCryptoError::InvalidInput);
+        }
 
-        let e = Scalar::hash_to_group_element(&ro.evaluate(&(g1, g2, h1, h2, alphas, t, &self.x)));
+        let e = Scalar::hash_to_group_element(&ro.evaluate(&(g1, g2, h1, h2, t, &self.x)));
 
         let r = (0..self.x.len())
             .map(|_| {
@@ -226,9 +223,7 @@ impl LDProof {
             })
             .collect::<Vec<_>>();
 
-        let z_values = (0..self.x.len())
-            .map(|i| poly_eval_at(&self.z, alphas[i]))
-            .collect::<Vec<_>>();
+        let z_values = eval_at_share_points(&self.z, self.x.len() - 1);
 
         let mut scalars = Vec::new();
         let mut points = Vec::new();
@@ -334,8 +329,9 @@ impl RVSS {
         let mut c = Vec::new();
         let mut c_hat = Vec::new();
 
+        let shares = eval_at_share_points(&poly, pks.len());
         for (j, pk) in pks.iter().enumerate() {
-            let s_j = poly.eval(share_index(j)).value;
+            let s_j = shares[j + 1];
             let s_hat_j = g * s_j;
             let v_j = h * s_j;
             let c_hat_j = pk * s_j;
@@ -356,9 +352,9 @@ impl RVSS {
         let h_omega = h * omega; // v_0 = h^omega, the recovery gadget's commitment
 
         let (g1, g2, h1, h2) = Self::mldei_vectors(h, h_omega, pks, &c_hat, &v);
-        // Evaluation points A = {0, ..., n}, where point 0 carries v_0 = h^omega
-        let alphas = (0..=pks.len()).collect_vec();
-        let mldei_proof = LDProof::new(&g1, &g2, &h1, &h2, &alphas, t, &poly);
+        // Evaluation points A = {0, share_point(0), ..., share_point(n-1)}, where point 0
+        // carries v_0 = h^omega
+        let mldei_proof = LDProof::new(&g1, &g2, &h1, &h2, t, &poly);
 
         RVSS {
             v,
@@ -377,8 +373,7 @@ impl RVSS {
         let (_g, h) = Self::bases();
         let (g1, g2, h1, h2) =
             Self::mldei_vectors(h, self.gadget.h_omega, pks, &self.c_hat, &self.v);
-        let alphas = (0..=n).collect_vec();
-        self.mldei_proof.verify(&g1, &g2, &h1, &h2, &alphas, t)?;
+        self.mldei_proof.verify(&g1, &g2, &h1, &h2, t)?;
         self.gadget.verify(k)?;
 
         Ok(())
@@ -428,19 +423,18 @@ impl RVSS {
         proof.verify(&g, s_hat_i, pk, &self.c_hat[i])
     }
 
+    // `indices` are 1-based party indices; party i's evaluation point is share_point(i - 1)
     fn lagrange_coeffs_for_c0(indices: &[usize]) -> Vec<Scalar> {
-        indices
-            .iter()
+        let xs = indices.iter().map(|&i| share_point(i - 1)).collect_vec();
+        xs.iter()
             .enumerate()
             .map(|(i, &xi)| {
-                let xi = Scalar::from(xi as u128);
                 let mut num = Scalar::from(1u128);
                 let mut den = Scalar::from(1u128);
-                for (j, &xj) in indices.iter().enumerate() {
+                for (j, &xj) in xs.iter().enumerate() {
                     if i == j {
                         continue;
                     }
-                    let xj = Scalar::from(xj as u128);
                     num = num * xj;
                     den = den * (xj - xi);
                 }
@@ -500,19 +494,81 @@ impl RVSS {
     }
 }
 
-fn share_index(i: usize) -> NonZeroU16 {
-    NonZeroU16::new((i + 1) as u16).expect("index must be non-zero")
+//////// Evaluation points and FFT ////////
+
+// Party j (0-based) gets the evaluation point w^bitrev32(j), where w is a primitive
+// 2^TWO_ADICITY-th root of unity. For N = 2^m and j < N this equals w_N^bitrev_m(j) with
+// w_N = w^(2^(32-m)), so the first N parties are exactly the N-th roots of unity and all shares
+// can be computed with one radix-2 FFT. Only works for BLS12-381 (Ristretto255's scalar field
+// has 2-adicity 2).
+const TWO_ADICITY: u32 = 32;
+
+// w = 7^((r-1)/2^32) in the BLS12-381 scalar field, big-endian
+const ROOT_OF_UNITY: [u8; 32] = [
+    0x16, 0xa2, 0xa1, 0x9e, 0xdf, 0xe8, 0x1f, 0x20, 0xd0, 0x9b, 0x68, 0x19, 0x22, 0xc8, 0x13, 0xb4,
+    0xb6, 0x36, 0x83, 0x50, 0x8c, 0x22, 0x80, 0xb9, 0x38, 0x29, 0x97, 0x1f, 0x43, 0x9f, 0x0d, 0x2b,
+];
+
+// w^e by square-and-multiply
+fn root_pow(mut e: u64) -> Scalar {
+    let mut base = Scalar::from_byte_array(&ROOT_OF_UNITY).expect("valid scalar");
+    let mut acc = Scalar::from(1u128);
+    while e > 0 {
+        if e & 1 == 1 {
+            acc = acc * base;
+        }
+        base = base * base;
+        e >>= 1;
+    }
+    acc
 }
 
-// Evaluate a polynomial at integer evaluation point `i`. Point 0 is the constant term
-// (the ShareIndex used elsewhere is a NonZeroU16 and cannot represent 0). Used by the MLDEI
-// proof so it can include the index-0 entry v_0 = h^omega = h^{p(0)}.
-fn poly_eval_at(poly: &Poly<Scalar>, i: usize) -> Scalar {
-    if i == 0 {
-        *poly.c0()
-    } else {
-        poly.eval(NonZeroU16::new(i as u16).expect("nonzero")).value
+// Reverse the lowest `bits` bits of `i`
+fn bitrev(i: usize, bits: u32) -> usize {
+    (i as u32).reverse_bits().checked_shr(32 - bits).unwrap_or(0) as usize
+}
+
+fn share_point(j: usize) -> Scalar {
+    root_pow(bitrev(j, TWO_ADICITY) as u64)
+}
+
+// Returns [poly(0), poly(share_point(0)), ..., poly(share_point(n-1))] using one radix-2 FFT
+// over the smallest power-of-two domain that fits both the n parties and the coefficients.
+fn eval_at_share_points(poly: &Poly<Scalar>, n: usize) -> Vec<Scalar> {
+    let degree = poly.degree();
+    let size = n.max(degree + 1).next_power_of_two();
+    let log_size = size.trailing_zeros();
+    assert!(log_size <= TWO_ADICITY);
+
+    let mut a = vec![Scalar::zero(); size];
+    for (i, c) in poly.as_vec().iter().take(degree + 1).enumerate() {
+        a[bitrev(i, log_size)] = *c;
     }
+
+    let w_n = root_pow(1u64 << (TWO_ADICITY - log_size));
+    let twiddles = std::iter::successors(Some(Scalar::from(1u128)), |x| Some(*x * w_n))
+        .take(size / 2)
+        .collect_vec();
+
+    // Iterative Cooley-Tukey. Afterwards a[k] = poly(w_N^k).
+    let mut len = 2;
+    while len <= size {
+        let half = len / 2;
+        let step = size / len;
+        for chunk in a.chunks_mut(len) {
+            for k in 0..half {
+                let u = chunk[k];
+                let v = chunk[k + half] * twiddles[k * step];
+                chunk[k] = u + v;
+                chunk[k + half] = u - v;
+            }
+        }
+        len *= 2;
+    }
+
+    std::iter::once(*poly.c0())
+        .chain((0..n).map(|j| a[bitrev(j, log_size)]))
+        .collect()
 }
 
 // Multi-scalar multiplication that first merges repeated points by summing their scalars.
@@ -657,28 +713,45 @@ fn test_mldei() {
         .collect_vec();
 
     let t: usize = 31;
-    let alphas = (0..100).collect_vec();
     let p = Poly::rand(t as u16, &mut thread_rng());
-    let exponents1 = (0..100)
-        .map(|i| bases1[i] * poly_eval_at(&p, alphas[i]))
-        .collect_vec();
-    let exponents2 = (0..100)
-        .map(|i| bases2[i] * poly_eval_at(&p, alphas[i]))
-        .collect_vec();
+    let evals = eval_at_share_points(&p, 99);
+    let exponents1 = (0..100).map(|i| bases1[i] * evals[i]).collect_vec();
+    let exponents2 = (0..100).map(|i| bases2[i] * evals[i]).collect_vec();
 
-    let mut proof = LDProof::new(&bases1, &bases2, &exponents1, &exponents2, &alphas, t, &p);
+    let mut proof = LDProof::new(&bases1, &bases2, &exponents1, &exponents2, t, &p);
     proof
-        .verify(&bases1, &bases2, &exponents1, &exponents2, &alphas, t)
+        .verify(&bases1, &bases2, &exponents1, &exponents2, t)
         .unwrap();
 
     proof
-        .verify(&bases1, &bases2, &exponents1, &exponents2, &alphas, t + 1)
+        .verify(&bases1, &bases2, &exponents1, &exponents2, t + 1)
         .unwrap_err();
 
     proof.x()[0][0] = Point::generator();
     proof
-        .verify(&bases1, &bases2, &exponents1, &exponents2, &alphas, t)
+        .verify(&bases1, &bases2, &exponents1, &exponents2, t)
         .unwrap_err();
+}
+
+#[test]
+fn test_eval_at_share_points() {
+    // w has order exactly 2^32
+    assert_eq!(root_pow(1 << 31), -Scalar::from(1u128));
+
+    for (t, n) in [(0, 1), (3, 5), (31, 100), (40, 20), (66, 64)] {
+        let p = Poly::rand(t as u16, &mut thread_rng());
+        let horner = |x: Scalar| {
+            p.as_vec()
+                .iter()
+                .rev()
+                .fold(Scalar::zero(), |acc, c| acc * x + c)
+        };
+        let expected = std::iter::once(Scalar::zero())
+            .chain((0..n).map(share_point))
+            .map(horner)
+            .collect_vec();
+        assert_eq!(eval_at_share_points(&p, n), expected);
+    }
 }
 
 #[test]
