@@ -250,7 +250,7 @@ impl LDProof {
             }
         }
 
-        let msm = Point::multi_scalar_mul(&scalars[..], &points[..]).expect("valid sizes");
+        let msm = multi_scalar_mul_dedup(&scalars[..], &points[..]).expect("valid sizes");
 
         if msm == Point::zero() {
             return Ok(());
@@ -454,7 +454,7 @@ impl RVSS {
         points: &[Point],
     ) -> FastCryptoResult<Point> {
         let coeffs = Self::lagrange_coeffs_for_c0(indices);
-        Point::multi_scalar_mul(&coeffs, points)
+        multi_scalar_mul_dedup(&coeffs, points)
     }
     
     pub fn gadget_decrypt(&self, k: usize, g_omega: Point) -> FastCryptoResult<Scalar> {
