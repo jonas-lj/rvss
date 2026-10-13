@@ -5,9 +5,9 @@ use rand::thread_rng;
 
 mod rvss_benches {
     use super::*;
-    use fastcrypto::groups::{bls12381, GroupElement, Scalar as GScalar};
+    use fastcrypto::groups::{bls12381, GroupElement, MultiScalarMul, Scalar as GScalar};
     use itertools::Itertools;
-    use research_rvss::rvss::{multi_scalar_mul_dedup, Gadget, Point, Scalar, RVSS};
+    use research_rvss::rvss::{Gadget, Point, Scalar, RVSS};
     use std::hint::black_box;
 
     fn exps(c: &mut Criterion) {
@@ -35,7 +35,7 @@ mod rvss_benches {
             let (s_seq, p_seq) = (scalars.clone(), points.clone());
 
             group.bench_function(format!("msm m={}", m).as_str(), move |b| {
-                b.iter(|| black_box(multi_scalar_mul_dedup(&scalars, &points).unwrap()))
+                b.iter(|| black_box(Point::multi_scalar_mul(&scalars, &points).unwrap()))
             });
             group.bench_function(format!("sequential m={}", m).as_str(), move |b| {
                 b.iter(|| {
