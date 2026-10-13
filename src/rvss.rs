@@ -423,9 +423,17 @@ impl RVSS {
         proof.verify(&g, s_hat_i, pk, &self.c_hat[i])
     }
 
-    // `indices` are 1-based party indices; party i's evaluation point is share_point(i - 1)
+    // `indices` are 1-based party indices; party i's evaluation point is share_point(i - 1).
+    // That equals w_N^bitrev_m(i - 1) for any domain size N = 2^m >= i, so all points are looked
+    // up in the powers of w_N for the smallest such N instead of computing each one separately.
     fn lagrange_coeffs_for_c0(indices: &[usize]) -> Vec<Scalar> {
-        let xs = indices.iter().map(|&i| share_point(i - 1)).collect_vec();
+        let size = indices.iter().max().map_or(1, |&i| i.next_power_of_two());
+        let log_size = size.trailing_zeros();
+        let powers = domain_powers(log_size, size);
+        let xs = indices
+            .iter()
+            .map(|&i| powers[bitrev(i - 1, log_size)])
+            .collect_vec();
         xs.iter()
             .enumerate()
             .map(|(i, &xi)| {
@@ -528,6 +536,18 @@ fn bitrev(i: usize, bits: u32) -> usize {
     (i as u32).reverse_bits().checked_shr(32 - bits).unwrap_or(0) as usize
 }
 
+// The first `count` powers of w_N, the primitive N-th root of unity for N = 2^log_size
+fn domain_powers(log_size: u32, count: usize) -> Vec<Scalar> {
+    assert!(log_size <= TWO_ADICITY);
+    let w_n = root_pow(1u64 << (TWO_ADICITY - log_size));
+    std::iter::successors(Some(Scalar::from(1u128)), |x| Some(*x * w_n))
+        .take(count)
+        .collect_vec()
+}
+
+// Party j's evaluation point, computed directly. The protocol code gets the same points from
+// the FFT domain instead; this is the reference definition used by the tests.
+#[cfg(test)]
 fn share_point(j: usize) -> Scalar {
     root_pow(bitrev(j, TWO_ADICITY) as u64)
 }
@@ -545,10 +565,7 @@ fn eval_at_share_points(poly: &Poly<Scalar>, n: usize) -> Vec<Scalar> {
         a[bitrev(i, log_size)] = *c;
     }
 
-    let w_n = root_pow(1u64 << (TWO_ADICITY - log_size));
-    let twiddles = std::iter::successors(Some(Scalar::from(1u128)), |x| Some(*x * w_n))
-        .take(size / 2)
-        .collect_vec();
+    let twiddles = domain_powers(log_size, size / 2);
 
     // Iterative Cooley-Tukey. Afterwards a[k] = poly(w_N^k).
     let mut len = 2;
@@ -737,6 +754,14 @@ fn test_mldei() {
 fn test_eval_at_share_points() {
     // w has order exactly 2^32
     assert_eq!(root_pow(1 << 31), -Scalar::from(1u128));
+
+    // A party's point does not depend on the domain size it is looked up in
+    for log_size in [0, 3, 7] {
+        let powers = domain_powers(log_size, 1 << log_size);
+        for j in 0..(1 << log_size) {
+            assert_eq!(powers[bitrev(j, log_size)], share_point(j));
+        }
+    }
 
     for (t, n) in [(0, 1), (3, 5), (31, 100), (40, 20), (66, 64)] {
         let p = Poly::rand(t as u16, &mut thread_rng());
