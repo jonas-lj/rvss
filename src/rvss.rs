@@ -515,6 +515,31 @@ fn poly_eval_at(poly: &Poly<Scalar>, i: usize) -> Scalar {
     }
 }
 
+// Multi-scalar multiplication that first merges repeated points by summing their scalars.
+// Points are compared by their byte encoding. Logs the number of removed duplicates.
+pub fn multi_scalar_mul_dedup(scalars: &[Scalar], points: &[Point]) -> FastCryptoResult<Point> {
+    if scalars.len() != points.len() {
+        return Err(FastCryptoError::InvalidInput);
+    }
+    let (dedup_points, dedup_scalars): (Vec<_>, Vec<_>) = points
+        .iter()
+        .zip(scalars)
+        .map(|(p, s)| (p.to_byte_array(), (*p, *s)))
+        .into_grouping_map()
+        .fold_first(|(p, acc), _, (_, s)| (p, acc + s))
+        .into_values()
+        .unzip();
+    let removed = points.len() - dedup_points.len();
+    if removed > 0 {
+        eprintln!(
+            "multi_scalar_mul_dedup: deduplicated {} of {} points",
+            removed,
+            points.len()
+        );
+    }
+    Point::multi_scalar_mul(&dedup_scalars, &dedup_points)
+}
+
 // Remove the one-time pad `pad` from `padded` and decode the result as a scalar. Fails if the
 // lengths differ or the result is not the canonical encoding of an element of Z_q.
 fn unpad_scalar(pad: &[u8], padded: &[u8]) -> FastCryptoResult<Scalar> {
@@ -532,6 +557,20 @@ fn unpad_scalar(pad: &[u8], padded: &[u8]) -> FastCryptoResult<Scalar> {
 }
 
 // Following tests check the e2e functionalities and a few malformed inputs, not all edge cases
+
+#[test]
+fn test_multi_scalar_mul_dedup() {
+    let g = Point::generator();
+    let h = g * Scalar::rand(&mut thread_rng());
+    let points = vec![g, h, g, g, h];
+    let scalars = (0..points.len())
+        .map(|_| Scalar::rand(&mut thread_rng()))
+        .collect_vec();
+    assert_eq!(
+        multi_scalar_mul_dedup(&scalars, &points).unwrap(),
+        Point::multi_scalar_mul(&scalars, &points).unwrap()
+    );
+}
 
 #[test]
 fn test_gadget() {
